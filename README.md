@@ -10,6 +10,10 @@ A Python tool that generates **pairwise (2-way) combinatorial test suites** from
 - **Built-in verification** — every output suite is checked for full pairwise coverage
 - **Configurable** — control Cartesian threshold, time limits, and exact/greedy mode
 
+
+https://github.com/user-attachments/assets/c1dfcf74-df8d-4aa8-a200-e9984363aaed
+
+
 ## Installation
 
 ```bash
