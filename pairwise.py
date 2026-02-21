@@ -3,7 +3,7 @@
 pairwise.py – Pairwise (2-way) test-suite generator.
 
 Hybrid strategy:
-  1. Greedy algorithm for a fast valid upper bound.
+  1. IPOG greedy algorithm for a fast valid upper bound.
   2. Optional exact CP-SAT solver (OR-Tools) for the true minimal suite.
 
 Dependencies:
@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import os
-from collections import Counter
 from itertools import product as cart_product
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -167,27 +166,68 @@ def build_pair_universe(values: List[List[str]]) -> List[Tuple[int, int, str, st
 
 
 # ---------------------------------------------------------------------------
-# GREEDY PAIRWISE SUITE
+# IPOG PAIRWISE SUITE
 # ---------------------------------------------------------------------------
+
+def _get_missing_pairs(
+    values: List[List[str]], k: int,
+) -> List[Tuple[Tuple[int, str], Tuple[int, str]]]:
+    """
+    Return all required pairs between parameter k and parameters 0..k-1.
+
+    Each pair is ((i, val_i), (k, val_k)).
+    """
+    pairs = []
+    for i in range(k):
+        for vi in values[i]:
+            for vk in values[k]:
+                pairs.append(((i, vi), (k, vk)))
+    return pairs
+
+
+def _count_covered(
+    row: List[str],
+    val: str,
+    k: int,
+    missing_pairs: List[Tuple[Tuple[int, str], Tuple[int, str]]],
+) -> int:
+    """Count how many missing pairs would be covered by assigning row[k]=val."""
+    count = 0
+    for i, row_val in enumerate(row):
+        if ((i, row_val), (k, val)) in missing_pairs:
+            count += 1
+    return count
+
+
+def _remove_covered(
+    row: List[str],
+    k: int,
+    missing_pairs: List[Tuple[Tuple[int, str], Tuple[int, str]]],
+) -> None:
+    """Remove from missing_pairs all pairs covered by the given row."""
+    for i in range(k):
+        pair = ((i, row[i]), (k, row[k]))
+        if pair in missing_pairs:
+            missing_pairs.remove(pair)
+
 
 def greedy_pairwise_suite(
     values: List[List[str]],
     verbose: bool = False,
 ) -> List[Tuple[str, ...]]:
     """
-    Deterministic greedy generator for a valid pairwise suite.
+    IPOG greedy generator for a valid pairwise suite.
 
-    Heuristics:
-      1. Seed each test from the "hardest" uncovered pair — the parameter
-         pair (i,j) with the most remaining uncovered combos.  Within that
-         pair, pick the lexicographically smallest requirement.
-      2. Fill remaining parameters in most-constrained-first order: next
-         parameter is the one with the most uncovered pairs against the
-         already-assigned parameters.
-      3. For each parameter, choose the value that maximises newly covered
-         pairs; ties broken by smallest value index.
+    Algorithm (In-Parameter-Order-General):
+      1. Start with the full Cartesian product of the first 2 parameters.
+      2. For each subsequent parameter k (2, 3, …, n-1):
+         a. HORIZONTAL GROWTH — extend every existing row with the value
+            for parameter k that covers the most uncovered pairs.
+         b. VERTICAL GROWTH — for any still-uncovered pair (i, k, vi, vk),
+            add a new row with those forced values and fill remaining
+            slots with default values.
 
-    Returns list of test tuples.
+    Returns list of test tuples (length n each).
     """
     n = len(values)
     if n == 0:
@@ -195,100 +235,59 @@ def greedy_pairwise_suite(
     if n == 1:
         return [(v,) for v in values[0]]
 
-    # Build requirement set for fast membership / removal
-    uncovered = set(build_pair_universe(values))
-    suite: List[Tuple[str, ...]] = []
-
-    # Maintain per-pair remaining counts for fast "hardest pair" lookup
-    pair_count: Counter = Counter()
-    for req in uncovered:
-        pair_count[(req[0], req[1])] += 1
-
-    while uncovered:
-        # 1. Pick the "hardest" parameter pair: max remaining count,
-        #    ties broken by smallest (i,j)
-        best_pair = max(
-            pair_count,
-            key=lambda ij: (pair_count[ij], -ij[0], -ij[1]),
-        )
-        pi, pj = best_pair
-
-        # Within that pair, pick the smallest uncovered requirement
-        r = min(req for req in uncovered if req[0] == pi and req[1] == pj)
-        _, _, va, vb = r
-
-        # 2. Partial assignment
-        test: List[Optional[str]] = [None] * n
-        test[pi] = va
-        test[pj] = vb
-        assigned = {pi, pj}
-
-        # 3. Fill remaining parameters in most-constrained-first order
-        remaining_params = set(range(n)) - assigned
-        while remaining_params:
-            # Find parameter with most uncovered pairs against assigned params
-            best_k: Optional[int] = None
-            best_k_impact: int = -1
-            for k in sorted(remaining_params):  # sorted for deterministic tie-break
-                impact = 0
-                for m in assigned:
-                    mi, mj = (min(k, m), max(k, m))
-                    impact += pair_count.get((mi, mj), 0)
-                if impact > best_k_impact or (
-                    impact == best_k_impact and (best_k is None or k < best_k)
-                ):
-                    best_k_impact = impact
-                    best_k = k
-            k = best_k  # type: ignore[assignment]
-
-            # Choose value for k maximising newly covered pairs
-            best_val: Optional[str] = None
-            best_count: int = -1
-            best_idx: Optional[int] = None
-            for vi, x in enumerate(values[k]):
-                count = 0
-                for m in assigned:
-                    if m < k:
-                        pair = (m, k, test[m], x)  # type: ignore[arg-type]
-                    else:
-                        pair = (k, m, x, test[m])  # type: ignore[arg-type]
-                    if pair in uncovered:
-                        count += 1
-                if count > best_count or (
-                    count == best_count and (best_idx is None or vi < best_idx)
-                ):
-                    best_count = count
-                    best_val = x
-                    best_idx = vi
-            test[k] = best_val
-            assigned.add(k)
-            remaining_params.discard(k)
-
-        test_tuple = tuple(test)  # type: ignore[arg-type]
-        suite.append(test_tuple)
-
-        # Remove covered requirements and update pair counts
-        covered_now: List[Tuple[int, int, str, str]] = []
-        for i in range(n):
-            for j in range(i + 1, n):
-                pair = (i, j, test_tuple[i], test_tuple[j])
-                if pair in uncovered:
-                    covered_now.append(pair)
-
-        for pair in covered_now:
-            uncovered.discard(pair)
-            ij = (pair[0], pair[1])
-            pair_count[ij] -= 1
-            if pair_count[ij] <= 0:
-                del pair_count[ij]
-
-        if verbose and len(suite) % 5 == 0:
-            print(f"  [greedy] tests so far: {len(suite)}, uncovered remaining: {len(uncovered)}")
+    # Step 1: seed with full Cartesian product of first 2 parameters
+    suite: List[List[str]] = [
+        list(combo) for combo in cart_product(values[0], values[1])
+    ]
 
     if verbose:
-        print(f"  [greedy] done — {len(suite)} tests")
+        print(f"  [ipog] seed: {len(suite)} tests from params 0,1 "
+              f"(sizes {len(values[0])}×{len(values[1])})")
 
-    return suite
+    # Step 2: extend one parameter at a time
+    for k in range(2, n):
+        # Build list of all required pairs for this parameter
+        missing_pairs = _get_missing_pairs(values, k)
+
+        # --- HORIZONTAL GROWTH ---
+        # Extend each existing row with the best value for parameter k
+        for row in suite:
+            best_val = values[k][0]
+            best_gain = -1
+            for val in values[k]:
+                gain = _count_covered(row, val, k, missing_pairs)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_val = val
+            row.append(best_val)
+            _remove_covered(row, k, missing_pairs)
+
+        if verbose:
+            print(f"  [ipog] param {k}: after horizontal, "
+                  f"missing={len(missing_pairs)}")
+
+        # --- VERTICAL GROWTH ---
+        # For each still-uncovered pair, add a new row
+        for pair in list(missing_pairs):
+            # Check if already covered by a previously added vertical row
+            already_covered = any(
+                row[pair[0][0]] == pair[0][1] and row[pair[1][0]] == pair[1][1]
+                for row in suite
+            )
+            if already_covered:
+                continue
+
+            # Create new row forcing the uncovered pair
+            new_row = [values[j][0] for j in range(k + 1)]  # defaults
+            new_row[pair[0][0]] = pair[0][1]  # force param i = val_i
+            new_row[pair[1][0]] = pair[1][1]  # force param k = val_k
+            suite.append(new_row)
+
+        if verbose:
+            print(f"  [ipog] param {k}: after vertical, suite={len(suite)}")
+
+    # Convert to tuples
+    return [tuple(row) for row in suite]
 
 
 # ---------------------------------------------------------------------------
@@ -319,20 +318,8 @@ def solve_exact_minimal(
     Uses the full Cartesian product as candidate tests and a single
     minimisation model: Minimize(sum(x_t)).
 
-    Args:
-        values: parameter value lists.
-        candidates: full Cartesian product.
-        LB: lower bound on suite size.
-        UB: upper bound (greedy suite size).
-        seed: random seed for solver.
-        exact_time_limit: optional time budget (seconds) for entire exact phase.
-        verbose: print progress.
-
     Returns:
         (suite_or_None, optimal_proven, exact_used)
-        - suite is the list of chosen test tuples, or None if no improvement found.
-        - optimal_proven is True if solver proved OPTIMAL.
-        - exact_used is True (always, since this function is called).
     """
     from ortools.sat.python import cp_model
 
@@ -385,12 +372,10 @@ def solve_exact_minimal(
         return chosen, optimal_proven, True
 
     if status == cp_model.INFEASIBLE:
-        # No suite smaller than UB exists → greedy is optimal
         if verbose:
-            print("  [exact] INFEASIBLE — greedy is already optimal")
+            print("  [exact] INFEASIBLE — IPOG is already optimal")
         return None, True, True
 
-    # UNKNOWN / timed out with no feasible solution found
     if verbose:
         print("  [exact] UNKNOWN/timeout — no improvement found")
     return None, False, True
@@ -517,14 +502,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.verbose:
         print(f"Bounds: LB={LB}  T={T}")
 
-    # ---- Greedy ----
+    # ---- IPOG Greedy ----
     if args.verbose:
-        print("Running greedy algorithm …")
+        print("Running IPOG algorithm …")
     suite_greedy = greedy_pairwise_suite(values, verbose=args.verbose)
     UB = len(suite_greedy)
     verify_pairwise(suite_greedy, values)
     if args.verbose:
-        print(f"Greedy suite verified — UB={UB}")
+        print(f"IPOG suite verified — UB={UB}")
 
     # ---- Decide exact phase ----
     exact_used = False
@@ -535,7 +520,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if UB == LB:
         optimal_proven = True
         if args.verbose:
-            print("Greedy already meets LB — optimal proven without exact phase.")
+            print("IPOG already meets LB — optimal proven without exact phase.")
     elif args.no_exact:
         if args.verbose:
             print("Exact phase skipped (--no-exact).")
@@ -567,13 +552,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                 print(f"Exact suite verified — size={final_size}, optimal_proven={optimal_proven}")
         else:
             if proven:
-                # INFEASIBLE → greedy is already optimal
                 optimal_proven = True
                 if args.verbose:
-                    print("Exact proved greedy is optimal.")
+                    print("Exact proved IPOG is optimal.")
             else:
                 if args.verbose:
-                    print("Exact phase did not improve on greedy.")
+                    print("Exact phase did not improve on IPOG.")
 
     # ---- Summary ----
     skipped_reason = ""
