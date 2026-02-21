@@ -169,48 +169,6 @@ def build_pair_universe(values: List[List[str]]) -> List[Tuple[int, int, str, st
 # IPOG PAIRWISE SUITE
 # ---------------------------------------------------------------------------
 
-def _get_missing_pairs(
-    values: List[List[str]], k: int,
-) -> List[Tuple[Tuple[int, str], Tuple[int, str]]]:
-    """
-    Return all required pairs between parameter k and parameters 0..k-1.
-
-    Each pair is ((i, val_i), (k, val_k)).
-    """
-    pairs = []
-    for i in range(k):
-        for vi in values[i]:
-            for vk in values[k]:
-                pairs.append(((i, vi), (k, vk)))
-    return pairs
-
-
-def _count_covered(
-    row: List[str],
-    val: str,
-    k: int,
-    missing_pairs: List[Tuple[Tuple[int, str], Tuple[int, str]]],
-) -> int:
-    """Count how many missing pairs would be covered by assigning row[k]=val."""
-    count = 0
-    for i, row_val in enumerate(row):
-        if ((i, row_val), (k, val)) in missing_pairs:
-            count += 1
-    return count
-
-
-def _remove_covered(
-    row: List[str],
-    k: int,
-    missing_pairs: List[Tuple[Tuple[int, str], Tuple[int, str]]],
-) -> None:
-    """Remove from missing_pairs all pairs covered by the given row."""
-    for i in range(k):
-        pair = ((i, row[i]), (k, row[k]))
-        if pair in missing_pairs:
-            missing_pairs.remove(pair)
-
-
 def greedy_pairwise_suite(
     values: List[List[str]],
     verbose: bool = False,
@@ -225,7 +183,7 @@ def greedy_pairwise_suite(
             for parameter k that covers the most uncovered pairs.
          b. VERTICAL GROWTH — for any still-uncovered pair (i, k, vi, vk),
             add a new row with those forced values and fill remaining
-            slots with default values.
+            slots to maximise additional pair coverage.
 
     Returns list of test tuples (length n each).
     """
@@ -246,8 +204,13 @@ def greedy_pairwise_suite(
 
     # Step 2: extend one parameter at a time
     for k in range(2, n):
-        # Build list of all required pairs for this parameter
-        missing_pairs = _get_missing_pairs(values, k)
+        # Build SET of all required pairs for parameter k.
+        # Each pair is (i, vi, vk) — k is implicit/fixed for this iteration.
+        missing: set[Tuple[int, str, str]] = set()
+        for i in range(k):
+            for vi in values[i]:
+                for vk in values[k]:
+                    missing.add((i, vi, vk))
 
         # --- HORIZONTAL GROWTH ---
         # Extend each existing row with the best value for parameter k
@@ -255,32 +218,29 @@ def greedy_pairwise_suite(
             best_val = values[k][0]
             best_gain = -1
             for val in values[k]:
-                gain = _count_covered(row, val, k, missing_pairs)
+                # Count how many missing pairs this value would cover (O(k))
+                gain = sum(1 for i in range(k) if (i, row[i], val) in missing)
                 if gain > best_gain:
                     best_gain = gain
                     best_val = val
             row.append(best_val)
-            _remove_covered(row, k, missing_pairs)
+            # Remove covered pairs
+            for i in range(k):
+                missing.discard((i, row[i], best_val))
 
         if verbose:
             print(f"  [ipog] param {k}: after horizontal, "
-                  f"missing={len(missing_pairs)}")
+                  f"missing={len(missing)}")
 
         # --- VERTICAL GROWTH ---
-        # For each still-uncovered pair, add a new row
-        for pair in list(missing_pairs):
-            # Check if already covered by a previously added vertical row
-            already_covered = any(
-                row[pair[0][0]] == pair[0][1] and row[pair[1][0]] == pair[1][1]
-                for row in suite
-            )
-            if already_covered:
-                continue
+        # Pop uncovered pairs (deterministic: smallest first) and add rows
+        while missing:
+            i, vi, vk = min(missing)  # deterministic pick
 
             # Create new row forcing the uncovered pair
-            new_row = [None] * (k + 1)
-            new_row[pair[0][0]] = pair[0][1]  # force param i = val_i
-            new_row[pair[1][0]] = pair[1][1]  # force param k = val_k
+            new_row: List[Optional[str]] = [None] * (k + 1)
+            new_row[i] = vi
+            new_row[k] = vk
 
             # Fill remaining slots: pick value covering the most missing pairs
             for j in range(k + 1):
@@ -289,17 +249,17 @@ def greedy_pairwise_suite(
                 best_fill = values[j][0]
                 best_fill_gain = -1
                 for val in values[j]:
-                    gain = _count_covered(new_row, val, k, missing_pairs) if j != k else 0
-                    # Also count pairs (j, k) covered
-                    if j < k and ((j, val), (k, new_row[k])) in missing_pairs:
-                        gain += 1
+                    # Count pairs (j, val, vk) that are still missing
+                    gain = 1 if j < k and (j, val, vk) in missing else 0
                     if gain > best_fill_gain:
                         best_fill_gain = gain
                         best_fill = val
                 new_row[j] = best_fill
 
             suite.append(new_row)
-            _remove_covered(new_row, k, missing_pairs)
+            # Remove all pairs covered by this new row
+            for i2 in range(k):
+                missing.discard((i2, new_row[i2], vk))
 
         if verbose:
             print(f"  [ipog] param {k}: after vertical, suite={len(suite)}")
