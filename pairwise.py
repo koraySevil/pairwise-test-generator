@@ -278,10 +278,28 @@ def greedy_pairwise_suite(
                 continue
 
             # Create new row forcing the uncovered pair
-            new_row = [values[j][0] for j in range(k + 1)]  # defaults
+            new_row = [None] * (k + 1)
             new_row[pair[0][0]] = pair[0][1]  # force param i = val_i
             new_row[pair[1][0]] = pair[1][1]  # force param k = val_k
+
+            # Fill remaining slots: pick value covering the most missing pairs
+            for j in range(k + 1):
+                if new_row[j] is not None:
+                    continue
+                best_fill = values[j][0]
+                best_fill_gain = -1
+                for val in values[j]:
+                    gain = _count_covered(new_row, val, k, missing_pairs) if j != k else 0
+                    # Also count pairs (j, k) covered
+                    if j < k and ((j, val), (k, new_row[k])) in missing_pairs:
+                        gain += 1
+                    if gain > best_fill_gain:
+                        best_fill_gain = gain
+                        best_fill = val
+                new_row[j] = best_fill
+
             suite.append(new_row)
+            _remove_covered(new_row, k, missing_pairs)
 
         if verbose:
             print(f"  [ipog] param {k}: after vertical, suite={len(suite)}")
