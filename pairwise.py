@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""
+pairwise.py – Pairwise (2-way) test-suite generator.
+
+Hybrid strategy:
+  1. Greedy algorithm for a fast valid upper bound.
+  2. Optional exact CP-SAT solver (OR-Tools) for the true minimal suite.
+
+Dependencies:
+  pip install openpyxl ortools
+
+Example CLI usage:
+  python pairwise.py --input params.xlsx --output suite.xlsx --verbose
+  python pairwise.py --input params.xlsx --output suite.xlsx --no-exact
+  python pairwise.py --input params.xlsx --output suite.xlsx --T_MAX 10000 --exact_time_limit 60
+
+Input Excel format (first sheet by default):
+  Row 1 = parameter names (unique, non-empty).
+  Rows 2..R = possible values per column; empty cells are ignored.
+
+Output Excel:
+  Sheet "Suite" = the generated test cases (same column headers).
+  Sheet "Summary" = LB, UB, FINAL_SIZE, OPTIMAL_PROVEN, T, T_MAX, etc.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from collections import Counter
+from itertools import product as cart_product
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import openpyxl
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    p = argparse.ArgumentParser(
+        description="Generate a pairwise (2-way) test suite from an Excel parameter table."
+    )
+    p.add_argument("--input", required=True, help="Path to input Excel file")
+    p.add_argument("--output", required=True, help="Path to output Excel file")
+    p.add_argument("--sheet", default=None, help="Sheet name to read (default: first sheet)")
+    p.add_argument("--seed", type=int, default=0, help="Deterministic seed for tie-breaking (default: 0)")
+    p.add_argument("--T_MAX", type=int, default=50_000, help="Cartesian threshold for enabling exact phase (default: 50000)")
+    p.add_argument("--exact_time_limit", type=float, default=None,
+                   help="Optional time limit in seconds for exact phase only")
+    p.add_argument("--no-exact", action="store_true", help="Force skipping the exact phase")
+    p.add_argument("--verbose", action="store_true", help="Print progress logs")
+    return p.parse_args(argv)
+
+
+# ---------------------------------------------------------------------------
+# INPUT PARSING
+# ---------------------------------------------------------------------------
+
+def read_input_excel(path: str, sheet: Optional[str] = None) -> Tuple[List[str], List[List[str]]]:
+    """
+    Read parameter names and their possible values from an Excel file.
+
+    Returns:
+        param_names: list of parameter name strings (column headers).
+        values: list of lists; values[j] = de-duplicated list of string values
+                for parameter j, preserving first-occurrence order.
+    """
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb[sheet] if sheet else wb.active
+
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    if not rows:
+        return [], []
+
+    # Row 1 → headers
+    header_row = rows[0]
+    param_names: List[str] = []
+    col_indices: List[int] = []
+    for col_idx, cell_val in enumerate(header_row):
+        if cell_val is not None and str(cell_val).strip() != "":
+            param_names.append(str(cell_val).strip())
+            col_indices.append(col_idx)
+
+    if not param_names:
+        return [], []
+
+    # Check uniqueness
+    if len(param_names) != len(set(param_names)):
+        raise ValueError("Parameter names must be unique.")
+
+    # Rows 2..R → values
+    data_rows = rows[1:]
+    values: List[List[str]] = [[] for _ in param_names]
+    for row in data_rows:
+        for j, col_idx in enumerate(col_indices):
+            cell = row[col_idx] if col_idx < len(row) else None
+            if cell is not None and str(cell).strip() != "":
+                s = str(cell).strip()
+                if s not in values[j]:          # de-dup, preserve order
+                    values[j].append(s)
+
+    for j, name in enumerate(param_names):
+        if len(values[j]) == 0:
+            raise ValueError(f"Parameter '{name}' has no values.")
+
+    return param_names, values
+
+
+# ---------------------------------------------------------------------------
+# BOUNDS
+# ---------------------------------------------------------------------------
+
+def compute_bounds(values: List[List[str]]) -> Tuple[int, int]:
+    """
+    Compute lower bound (LB) and Cartesian product size (T).
+
+    LB = max(v_i * v_j) for all i < j   (0 if n < 2).
+    T  = product of v_i.
+
+    Returns (LB, T).
+    """
+    n = len(values)
+    if n == 0:
+        return 0, 0
+    if n == 1:
+        return len(values[0]), len(values[0])
+
+    sizes = [len(v) for v in values]
+
+    # T (Cartesian size)
+    T = 1
+    for s in sizes:
+        T *= s
+
+    # LB = max(v_i * v_j) for i < j
+    LB = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            LB = max(LB, sizes[i] * sizes[j])
+
+    return LB, T
+
+
+# ---------------------------------------------------------------------------
+# REQUIREMENT UNIVERSE
+# ---------------------------------------------------------------------------
+
+def build_pair_universe(values: List[List[str]]) -> List[Tuple[int, int, str, str]]:
+    """
+    Build the full list of pairwise requirements.
+
+    Each requirement is (i, j, a, b) where i < j, a ∈ values[i], b ∈ values[j].
+    """
+    n = len(values)
+    universe: List[Tuple[int, int, str, str]] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            for a in values[i]:
+                for b in values[j]:
+                    universe.append((i, j, a, b))
+    return universe
+
+
+# ---------------------------------------------------------------------------
+# GREEDY PAIRWISE SUITE
+# ---------------------------------------------------------------------------
+
+def greedy_pairwise_suite(
+    values: List[List[str]],
+    verbose: bool = False,
+) -> List[Tuple[str, ...]]:
+    """
+    Deterministic greedy generator for a valid pairwise suite.
+
+    Heuristics:
+      1. Seed each test from the "hardest" uncovered pair — the parameter
+         pair (i,j) with the most remaining uncovered combos.  Within that
+         pair, pick the lexicographically smallest requirement.
+      2. Fill remaining parameters in most-constrained-first order: next
+         parameter is the one with the most uncovered pairs against the
+         already-assigned parameters.
+      3. For each parameter, choose the value that maximises newly covered
+         pairs; ties broken by smallest value index.
+
+    Returns list of test tuples.
+    """
+    n = len(values)
+    if n == 0:
+        return []
+    if n == 1:
+        return [(v,) for v in values[0]]
+
+    # Build requirement set for fast membership / removal
+    uncovered = set(build_pair_universe(values))
+    suite: List[Tuple[str, ...]] = []
+
+    # Maintain per-pair remaining counts for fast "hardest pair" lookup
+    pair_count: Counter = Counter()
+    for req in uncovered:
+        pair_count[(req[0], req[1])] += 1
+
+    while uncovered:
+        # 1. Pick the "hardest" parameter pair: max remaining count,
+        #    ties broken by smallest (i,j)
+        best_pair = max(
+            pair_count,
+            key=lambda ij: (pair_count[ij], -ij[0], -ij[1]),
+        )
+        pi, pj = best_pair
+
+        # Within that pair, pick the smallest uncovered requirement
+        r = min(req for req in uncovered if req[0] == pi and req[1] == pj)
+        _, _, va, vb = r
+
+        # 2. Partial assignment
+        test: List[Optional[str]] = [None] * n
+        test[pi] = va
+        test[pj] = vb
+        assigned = {pi, pj}
+
+        # 3. Fill remaining parameters in most-constrained-first order
+        remaining_params = set(range(n)) - assigned
+        while remaining_params:
+            # Find parameter with most uncovered pairs against assigned params
+            best_k: Optional[int] = None
+            best_k_impact: int = -1
+            for k in sorted(remaining_params):  # sorted for deterministic tie-break
+                impact = 0
+                for m in assigned:
+                    mi, mj = (min(k, m), max(k, m))
+                    impact += pair_count.get((mi, mj), 0)
+                if impact > best_k_impact or (
+                    impact == best_k_impact and (best_k is None or k < best_k)
+                ):
+                    best_k_impact = impact
+                    best_k = k
+            k = best_k  # type: ignore[assignment]
+
+            # Choose value for k maximising newly covered pairs
+            best_val: Optional[str] = None
+            best_count: int = -1
+            best_idx: Optional[int] = None
+            for vi, x in enumerate(values[k]):
+                count = 0
+                for m in assigned:
+                    if m < k:
+                        pair = (m, k, test[m], x)  # type: ignore[arg-type]
+                    else:
+                        pair = (k, m, x, test[m])  # type: ignore[arg-type]
+                    if pair in uncovered:
+                        count += 1
+                if count > best_count or (
+                    count == best_count and (best_idx is None or vi < best_idx)
+                ):
+                    best_count = count
+                    best_val = x
+                    best_idx = vi
+            test[k] = best_val
+            assigned.add(k)
+            remaining_params.discard(k)
+
+        test_tuple = tuple(test)  # type: ignore[arg-type]
+        suite.append(test_tuple)
+
+        # Remove covered requirements and update pair counts
+        covered_now: List[Tuple[int, int, str, str]] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                pair = (i, j, test_tuple[i], test_tuple[j])
+                if pair in uncovered:
+                    covered_now.append(pair)
+
+        for pair in covered_now:
+            uncovered.discard(pair)
+            ij = (pair[0], pair[1])
+            pair_count[ij] -= 1
+            if pair_count[ij] <= 0:
+                del pair_count[ij]
+
+        if verbose and len(suite) % 5 == 0:
+            print(f"  [greedy] tests so far: {len(suite)}, uncovered remaining: {len(uncovered)}")
+
+    if verbose:
+        print(f"  [greedy] done — {len(suite)} tests")
+
+    return suite
+
+
+# ---------------------------------------------------------------------------
+# CARTESIAN CANDIDATES
+# ---------------------------------------------------------------------------
+
+def build_cartesian_candidates(values: List[List[str]]) -> List[Tuple[str, ...]]:
+    """Return the full Cartesian product of all parameter values."""
+    return list(cart_product(*values))
+
+
+# ---------------------------------------------------------------------------
+# EXACT MINIMAL PHASE (CP-SAT)
+# ---------------------------------------------------------------------------
+
+def solve_exact_minimal(
+    values: List[List[str]],
+    candidates: List[Tuple[str, ...]],
+    LB: int,
+    UB: int,
+    seed: int = 0,
+    exact_time_limit: Optional[float] = None,
+    verbose: bool = False,
+) -> Tuple[Optional[List[Tuple[str, ...]]], bool, bool]:
+    """
+    Attempt to find the true minimal pairwise suite via CP-SAT.
+
+    Uses the full Cartesian product as candidate tests and a single
+    minimisation model: Minimize(sum(x_t)).
+
+    Args:
+        values: parameter value lists.
+        candidates: full Cartesian product.
+        LB: lower bound on suite size.
+        UB: upper bound (greedy suite size).
+        seed: random seed for solver.
+        exact_time_limit: optional time budget (seconds) for entire exact phase.
+        verbose: print progress.
+
+    Returns:
+        (suite_or_None, optimal_proven, exact_used)
+        - suite is the list of chosen test tuples, or None if no improvement found.
+        - optimal_proven is True if solver proved OPTIMAL.
+        - exact_used is True (always, since this function is called).
+    """
+    from ortools.sat.python import cp_model
+
+    n = len(values)
+    universe = build_pair_universe(values)
+
+    # Pre-compute: for each requirement → list of candidate indices that cover it
+    req_to_cands: Dict[Tuple[int, int, str, str], List[int]] = {r: [] for r in universe}
+    for t_idx, cand in enumerate(candidates):
+        for i in range(n):
+            for j in range(i + 1, n):
+                req = (i, j, cand[i], cand[j])
+                req_to_cands[req].append(t_idx)
+
+    # Build a single model with minimisation objective
+    model = cp_model.CpModel()
+
+    x = [model.NewBoolVar(f"x_{t}") for t in range(len(candidates))]
+
+    # Coverage: each requirement must be covered by at least one selected candidate
+    for req, cand_ids in req_to_cands.items():
+        model.Add(sum(x[t] for t in cand_ids) >= 1)
+
+    # Bound hints to help the solver
+    model.Add(sum(x) >= LB)
+    model.Add(sum(x) <= UB - 1)  # only interested in improvements over greedy
+
+    # Objective: minimise total selected tests
+    model.Minimize(sum(x))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.num_search_workers = os.cpu_count() or 1
+    solver.parameters.random_seed = seed
+
+    if exact_time_limit is not None:
+        solver.parameters.max_time_in_seconds = exact_time_limit
+
+    if verbose:
+        solver.parameters.log_search_progress = True
+        print(f"  [exact] solving single model: Minimize(sum(x)), LB={LB}, UB={UB}")
+
+    status = solver.Solve(model)
+
+    if status in (cp_model.FEASIBLE, cp_model.OPTIMAL):
+        chosen = [candidates[t] for t in range(len(candidates)) if solver.Value(x[t])]
+        optimal_proven = (status == cp_model.OPTIMAL)
+        if verbose:
+            label = "OPTIMAL" if optimal_proven else "FEASIBLE (best found)"
+            print(f"  [exact] {label} — size={len(chosen)}")
+        return chosen, optimal_proven, True
+
+    if status == cp_model.INFEASIBLE:
+        # No suite smaller than UB exists → greedy is optimal
+        if verbose:
+            print("  [exact] INFEASIBLE — greedy is already optimal")
+        return None, True, True
+
+    # UNKNOWN / timed out with no feasible solution found
+    if verbose:
+        print("  [exact] UNKNOWN/timeout — no improvement found")
+    return None, False, True
+
+
+# ---------------------------------------------------------------------------
+# VERIFICATION
+# ---------------------------------------------------------------------------
+
+def verify_pairwise(suite: Sequence[Tuple[str, ...]], values: List[List[str]]) -> None:
+    """
+    Verify that `suite` achieves full pairwise coverage.
+    Raises AssertionError if any pair is missing.
+    """
+    n = len(values)
+    if n < 2:
+        return  # trivially covered
+
+    required = set(build_pair_universe(values))
+    covered: set = set()
+
+    for test in suite:
+        for i in range(n):
+            for j in range(i + 1, n):
+                pair = (i, j, test[i], test[j])
+                covered.add(pair)
+
+    missing = required - covered
+    if missing:
+        raise AssertionError(
+            f"Pairwise coverage FAILED — {len(missing)} pair(s) missing.\n"
+            f"Examples: {list(missing)[:5]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# OUTPUT
+# ---------------------------------------------------------------------------
+
+def write_output_excel(
+    path: str,
+    param_names: List[str],
+    suite: List[Tuple[str, ...]],
+    summary: Dict[str, Any],
+) -> None:
+    """
+    Write the test suite and summary to an Excel workbook.
+
+    Sheet "Suite" — test cases (same column headers).
+    Sheet "Summary" — key metrics.
+    """
+    wb = openpyxl.Workbook()
+
+    # ---- Suite sheet ----
+    ws_suite = wb.active
+    ws_suite.title = "Suite"
+    for col_idx, name in enumerate(param_names, start=1):
+        ws_suite.cell(row=1, column=col_idx, value=name)
+    for row_idx, test in enumerate(suite, start=2):
+        for col_idx, val in enumerate(test, start=1):
+            ws_suite.cell(row=row_idx, column=col_idx, value=val)
+
+    # ---- Summary sheet ----
+    ws_sum = wb.create_sheet("Summary")
+    summary_keys = [
+        "LB", "UB", "FINAL_SIZE", "OPTIMAL_PROVEN",
+        "T", "T_MAX", "EXACT_TIME_LIMIT", "EXACT_USED",
+    ]
+    ws_sum.cell(row=1, column=1, value="Metric")
+    ws_sum.cell(row=1, column=2, value="Value")
+    for row_idx, key in enumerate(summary_keys, start=2):
+        ws_sum.cell(row=row_idx, column=1, value=key)
+        val = summary.get(key, "")
+        if isinstance(val, bool):
+            val = "TRUE" if val else "FALSE"
+        ws_sum.cell(row=row_idx, column=2, value="" if val is None else val)
+
+    wb.save(path)
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
+
+    # ---- Read input ----
+    if args.verbose:
+        print(f"Reading input: {args.input}")
+    param_names, values = read_input_excel(args.input, args.sheet)
+    n = len(param_names)
+
+    if args.verbose:
+        for j, name in enumerate(param_names):
+            print(f"  {name}: {values[j]}")
+
+    # ---- Edge cases ----
+    if n == 0:
+        suite: List[Tuple[str, ...]] = []
+        summary: Dict[str, Any] = {
+            "LB": 0, "UB": 0, "FINAL_SIZE": 0,
+            "OPTIMAL_PROVEN": True, "T": 0, "T_MAX": args.T_MAX,
+            "EXACT_TIME_LIMIT": args.exact_time_limit, "EXACT_USED": False,
+        }
+        write_output_excel(args.output, param_names, suite, summary)
+        print("LB=0  UB=0  FINAL_SIZE=0  OPTIMAL_PROVEN=TRUE  (0 parameters)")
+        return
+
+    if n == 1:
+        suite = [(v,) for v in values[0]]
+        sz = len(suite)
+        summary = {
+            "LB": sz, "UB": sz, "FINAL_SIZE": sz,
+            "OPTIMAL_PROVEN": True, "T": sz, "T_MAX": args.T_MAX,
+            "EXACT_TIME_LIMIT": args.exact_time_limit, "EXACT_USED": False,
+        }
+        write_output_excel(args.output, param_names, suite, summary)
+        print(f"LB={sz}  UB={sz}  FINAL_SIZE={sz}  OPTIMAL_PROVEN=TRUE  (1 parameter)")
+        return
+
+    # ---- Bounds ----
+    LB, T = compute_bounds(values)
+    if args.verbose:
+        print(f"Bounds: LB={LB}  T={T}")
+
+    # ---- Greedy ----
+    if args.verbose:
+        print("Running greedy algorithm …")
+    suite_greedy = greedy_pairwise_suite(values, verbose=args.verbose)
+    UB = len(suite_greedy)
+    verify_pairwise(suite_greedy, values)
+    if args.verbose:
+        print(f"Greedy suite verified — UB={UB}")
+
+    # ---- Decide exact phase ----
+    exact_used = False
+    optimal_proven = False
+    final_suite = suite_greedy
+    final_size = UB
+
+    if UB == LB:
+        optimal_proven = True
+        if args.verbose:
+            print("Greedy already meets LB — optimal proven without exact phase.")
+    elif args.no_exact:
+        if args.verbose:
+            print("Exact phase skipped (--no-exact).")
+    elif T > args.T_MAX:
+        if args.verbose:
+            print(f"Exact phase skipped — Cartesian size T={T} > T_MAX={args.T_MAX}.")
+    else:
+        # ---- Run exact phase ----
+        if args.verbose:
+            print(f"Building Cartesian candidates (T={T}) …")
+        candidates = build_cartesian_candidates(values)
+        if args.verbose:
+            print(f"Starting exact phase: Minimize(sum(x)), LB={LB}, UB={UB}")
+
+        exact_suite, proven, _ = solve_exact_minimal(
+            values, candidates, LB, UB,
+            seed=args.seed,
+            exact_time_limit=args.exact_time_limit,
+            verbose=args.verbose,
+        )
+        exact_used = True
+
+        if exact_suite is not None:
+            verify_pairwise(exact_suite, values)
+            final_suite = exact_suite
+            final_size = len(exact_suite)
+            optimal_proven = proven
+            if args.verbose:
+                print(f"Exact suite verified — size={final_size}, optimal_proven={optimal_proven}")
+        else:
+            if proven:
+                # INFEASIBLE → greedy is already optimal
+                optimal_proven = True
+                if args.verbose:
+                    print("Exact proved greedy is optimal.")
+            else:
+                if args.verbose:
+                    print("Exact phase did not improve on greedy.")
+
+    # ---- Summary ----
+    skipped_reason = ""
+    if T > args.T_MAX and not args.no_exact:
+        skipped_reason = f"  EXACT_SKIPPED: T={T} > T_MAX={args.T_MAX}"
+
+    summary = {
+        "LB": LB, "UB": UB, "FINAL_SIZE": final_size,
+        "OPTIMAL_PROVEN": optimal_proven,
+        "T": T, "T_MAX": args.T_MAX,
+        "EXACT_TIME_LIMIT": args.exact_time_limit,
+        "EXACT_USED": exact_used,
+    }
+
+    # ---- Write output ----
+    write_output_excel(args.output, param_names, final_suite, summary)
+    if args.verbose:
+        print(f"Output written to {args.output}")
+
+    # ---- Stdout report ----
+    print(
+        f"LB={LB}  UB={UB}  FINAL_SIZE={final_size}  "
+        f"OPTIMAL_PROVEN={'TRUE' if optimal_proven else 'FALSE'}"
+        f"{skipped_reason}"
+    )
+
+
+if __name__ == "__main__":
+    main()
